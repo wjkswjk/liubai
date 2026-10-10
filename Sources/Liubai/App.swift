@@ -82,6 +82,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { model.finishReading() }
+    func windowWillClose(_ notification: Notification) { model.finishReading() }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         window.makeKeyAndOrderFront(nil)
@@ -123,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let reading = NSMenu(title: "阅读")
         add(reading, "章节目录", #selector(chapters), "t")
         add(reading, "搜索文字…", #selector(search), "f")
+        add(reading, "听书…", #selector(listening), "l")
         reading.addItem(.separator())
         add(reading, "上一页", #selector(previousPage), "")
         add(reading, "下一页", #selector(nextPage), "")
@@ -168,6 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func appearance() { model.togglePanel(.appearance) }
     @objc func chapters() { if model.book != nil { model.togglePanel(.chapters) } }
     @objc func search() { if model.book != nil { model.togglePanel(.search) } }
+    @objc func listening() { if model.book != nil { model.togglePanel(.listening) } }
     @objc func shortcuts() { model.togglePanel(.shortcuts) }
     @objc func previousPage() { model.page(.previous) }
     @objc func nextPage() { model.page(.next) }
@@ -180,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func fullscreen() { window.toggleFullScreen(nil) }
     @objc func about() {
         NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: "留白", .applicationVersion: "1.3.0",
+            .applicationName: "留白", .applicationVersion: "1.5.0",
             .credits: NSAttributedString(string: "一个安静的 TXT 阅读器\n原生 macOS · 离线阅读 · 自动保存"),
             .version: ""
         ])
@@ -188,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func helpPanel() {
         let alert = NSAlert()
         alert.messageText = "只留下文字"
-        alert.informativeText = "右键点击正文或按退出键，打开 / 关闭面板。\n拖动窗口边缘可任意调整大小，文字自动换行。\n拖动正文空白可移动窗口。翻页立即切换，无滚动动画。窗口没有边框和阴影。\n\n上一页键 / 下一页键  翻页（可自定义）\n⌘ ⇧ ,  自定义翻页快捷键\n⌘ O  打开 TXT 文件\n⌘ T  章节目录\n⌘ F  搜索文字\n⌘ ,  外观设置\n⌘ + / −  调整字号\n⌘ ⌥ ← / →  上一章 / 下一章\n⌃ ⌘ F  全屏\n⌘ W  关闭窗口\n⌘ Q  退出\n\n阅读进度、外观及快捷键自动保存在本机，重新打开即可继续。"
+        alert.informativeText = "右键点击正文或按退出键，打开 / 关闭面板。\n拖动窗口边缘可任意调整大小，文字自动换行。\n拖动正文空白可移动窗口，或按住 Option 拖动任意位置。翻页立即切换，无滚动动画。窗口没有边框和阴影。\n\n上一页键 / 下一页键  翻页（可自定义）\n空格 / Shift + 空格  下一页 / 上一页\n⌘ ⇧ ,  自定义翻页快捷键\n⌘ O  打开 TXT 文件\n⌘ T  章节目录\n⌘ F  搜索文字\n⌘ ,  外观设置\n⌘ + / −  调整字号\n⌘ ⌥ ← / →  上一章 / 下一章\n⌃ ⌘ F  全屏\n⌘ W  关闭窗口\n⌘ Q  退出\n\n阅读进度、外观及快捷键自动保存在本机，重新打开即可继续。"
         alert.addButton(withTitle: "开始阅读")
         alert.beginSheetModal(for: window)
     }

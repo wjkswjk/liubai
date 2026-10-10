@@ -42,8 +42,13 @@ final class ReadingTextView: NSTextView {
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { showPanel?(); return }
-        if [116, 126].contains(event.keyCode) { turnPage?(.previous); return }
-        if [121, 125].contains(event.keyCode) { turnPage?(.next); return }
+        let flags = event.modifierFlags.intersection(PagingKey.relevantModifiers)
+        if flags.isEmpty && [116, 126].contains(event.keyCode) { turnPage?(.previous); return }
+        if flags.isEmpty && [121, 125].contains(event.keyCode) { turnPage?(.next); return }
+        if event.keyCode == 49 && (flags.isEmpty || flags == .shift) {
+            turnPage?(flags == .shift ? .previous : .next)
+            return
+        }
         super.keyDown(with: event)
     }
 }
@@ -52,16 +57,13 @@ final class ReadingScrollView: NSScrollView {
     override var isOpaque: Bool { false }
     var viewportChanged: ((NSSize) -> Void)?
     var turnPage: ((PageDirection) -> Void)?
-    private var gestureTurnedPage = false
+    private var scrollGesture = PagingScrollGesture()
 
     override func scrollWheel(with event: NSEvent) {
-        guard event.momentumPhase.isEmpty else { return }
-        if event.phase.contains(.began) { gestureTurnedPage = false }
-        if !gestureTurnedPage && abs(event.scrollingDeltaY) > 0.1 {
-            turnPage?(event.scrollingDeltaY < 0 ? .next : .previous)
-            gestureTurnedPage = !event.phase.isEmpty
+        if let direction = scrollGesture.direction(delta: event.scrollingDeltaY, phase: event.phase,
+                momentum: event.momentumPhase, precise: event.hasPreciseScrollingDeltas) {
+            turnPage?(direction)
         }
-        if event.phase.contains(.ended) || event.phase.contains(.cancelled) { gestureTurnedPage = false }
     }
     override func tile() {
         super.tile()
@@ -126,7 +128,6 @@ struct ReaderView: NSViewRepresentable {
         scroll.turnPage = page
         text.turnPage = page
         scroll.viewportChanged = { [weak coordinator = context.coordinator] size in coordinator?.resize(size) }
-        context.coordinator.observeScroll()
         return scroll
     }
 
@@ -151,26 +152,32 @@ struct ReaderView: NSViewRepresentable {
         var lastJump: UUID?
         var lastPage: UUID?
         var lastViewport: NSSize = .zero
-        var source = NSAttributedString(string: "")
+        var source = NSMutableAttributedString(string: "")
         var lines: [ReadingLine] = []
         var anchor = 0
         var nextPosition = 0
         var pageHistory: [Int] = []
         var saveWork: DispatchWorkItem?
-        var isUpdating = false
         var isLayingOut = false
+        struct CachedPage {
+            let text: NSAttributedString
+            let lines: [ReadingLine]
+            let nextPosition: Int
+        }
+        private var pageCache: [Int: CachedPage] = [:]
+        private var cacheOrder: [Int] = []
+        private(set) var cacheHits = 0
+        var cachedPageCount: Int { pageCache.count }
 
         init(model: ReaderModel) { self.model = model }
 
-        func observeScroll() {}
         func removeObserver() { saveWork?.cancel() }
 
         func update() {
             guard let text, let scroll, let book = model.book else { return }
             let changedBook = previousBook != model.bookID
-            let changedStyle = previousPreferences.map { !model.preferences.hasSameTextStyle(as: $0) } ?? true
-            isUpdating = true
-            defer { isUpdating = false; scheduleSave() }
+            let changedStyle = previousPreferences.map { !model.preferences.hasSameLayout(as: $0) } ?? true
+            let changedColor = previousPreferences?.foreground != model.preferences.foreground
             if changedBook || changedStyle {
                 let prefs = model.preferences
                 let style = NSMutableParagraphStyle()
@@ -196,12 +203,23 @@ struct ReaderView: NSViewRepresentable {
                 ]
                 previousBook = model.bookID
                 pageHistory.removeAll()
-                renderPage(at: changedBook ? model.currentPosition : anchor, size: scroll.contentSize)
+                clearPageCache()
+            } else if changedColor {
+                let color = NSColor(hex: model.preferences.foreground)
+                source.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: source.length))
+                text.textStorage?.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: text.textStorage?.length ?? 0))
+                text.selectedTextAttributes = [
+                    .backgroundColor: color.withAlphaComponent(0.17), .foregroundColor: color
+                ]
+                text.needsDisplay = true
             }
             previousPreferences = model.preferences
             if let jump = model.jump, lastJump != jump.id {
                 lastJump = jump.id
                 scrollTo(jump.range, highlight: jump.highlight)
+            } else if changedBook || changedStyle {
+                renderPage(at: changedBook ? model.currentPosition : anchor, size: scroll.contentSize)
+                scheduleSave()
             }
             if let request = model.pageRequest, lastPage != request.id {
                 lastPage = request.id
@@ -215,6 +233,7 @@ struct ReaderView: NSViewRepresentable {
         func resize(_ size: NSSize, keepPosition: Bool = true) {
             guard size.width > 0, size.height > 0, size != lastViewport, !isLayingOut else { return }
             pageHistory.removeAll()
+            clearPageCache()
             renderPage(at: keepPosition ? anchor : 0, size: size)
             scheduleSave()
         }
@@ -231,18 +250,37 @@ struct ReaderView: NSViewRepresentable {
         }
 
         func renderPage(at position: Int, size: NSSize) {
-            guard !isLayingOut, size.width > 0, size.height > 0, source.length > 0,
-                  let text, let scroll, let manager = text.layoutManager, let container = text.textContainer else { return }
-            isLayingOut = true
-            defer { isLayingOut = false }
-            lastViewport = size
+            guard !isLayingOut, source.length > 0 else { return }
+            // NSViewRepresentable can update before it receives its first size.
+            // Retain the requested position so the first resize renders that page.
             let string = source.string as NSString
             let safe = max(0, min(position, source.length - 1))
             anchor = string.rangeOfComposedCharacterSequence(at: safe).location
+            guard size.width > 0, size.height > 0, let text, let scroll,
+                  let manager = text.layoutManager, let container = text.textContainer else { return }
+            isLayingOut = true
+            defer { isLayingOut = false }
+            if lastViewport != size { clearPageCache() }
+            lastViewport = size
             let inset = min(CGFloat(model.preferences.margin), max(18, size.width * 0.10))
             text.textContainerInset = NSSize(width: inset, height: ReadingPageGeometry.top)
             container.containerSize = NSSize(width: max(40, size.width - 2 * inset), height: CGFloat.greatestFiniteMagnitude)
             text.setFrameSize(NSSize(width: size.width, height: size.height))
+            if let cached = pageCache[anchor] {
+                cacheHits += 1
+                touchPage(anchor)
+                let page = NSMutableAttributedString(attributedString: cached.text)
+                page.addAttribute(.foregroundColor, value: NSColor(hex: model.preferences.foreground),
+                    range: NSRange(location: 0, length: page.length))
+                text.textStorage?.setAttributedString(page)
+                lines = cached.lines
+                nextPosition = cached.nextPosition
+                scroll.showImmediately(at: 0)
+                refreshVisibleLines()
+                text.setSelectedRange(NSRange(location: 0, length: 0))
+                stageCurrentPosition()
+                return
+            }
             var chunkLength = estimatedChunkSize(size)
             var pageLength = 0
             while true {
@@ -288,6 +326,23 @@ struct ReaderView: NSViewRepresentable {
             scroll.showImmediately(at: 0)
             refreshVisibleLines()
             text.setSelectedRange(NSRange(location: 0, length: 0))
+            pageCache[anchor] = CachedPage(text: NSAttributedString(attributedString: text.textStorage!),
+                lines: lines, nextPosition: nextPosition)
+            touchPage(anchor)
+            if cacheOrder.count > 16 {
+                pageCache.removeValue(forKey: cacheOrder.removeFirst())
+            }
+            stageCurrentPosition()
+        }
+
+        private func clearPageCache() { pageCache.removeAll(); cacheOrder.removeAll() }
+        private func touchPage(_ position: Int) {
+            cacheOrder.removeAll { $0 == position }
+            cacheOrder.append(position)
+        }
+        private func stageCurrentPosition() {
+            guard source.length > 0 else { return }
+            model.stagePosition(anchor, progress: nextPosition >= source.length ? 1 : Double(anchor) / Double(source.length))
         }
 
         func visiblePosition() -> Int { anchor }
@@ -350,7 +405,6 @@ struct ReaderView: NSViewRepresentable {
         }
 
         func scheduleSave() {
-            guard !isUpdating else { return }
             saveWork?.cancel()
             let work = DispatchWorkItem { [weak self] in self?.persistPosition() }
             saveWork = work
@@ -359,8 +413,8 @@ struct ReaderView: NSViewRepresentable {
 
         func persistPosition() {
             guard previousBook == model.bookID, source.length > 0 else { return }
-            let progress = nextPosition >= source.length ? 1 : Double(anchor) / Double(source.length)
-            model.updatePosition(anchor, progress: progress)
+            stageCurrentPosition()
+            model.flushPosition()
         }
     }
 }

@@ -171,7 +171,7 @@ struct ControlPanel: View {
                             .frame(maxWidth: .infinity).padding(.vertical, 10)
                             .background(tab == item ? Color(NSColor(hex: "EEECF2")) : .clear)
                             .clipShape(RoundedRectangle(cornerRadius: 7))
-                    }.buttonStyle(.plain).disabled(model.book == nil && (item == .chapters || item == .search))
+                    }.buttonStyle(.plain).disabled(model.book == nil && (item == .chapters || item == .search || item == .listening))
                 }
             }.padding(4).background(canvas).clipShape(RoundedRectangle(cornerRadius: 10))
                 .padding(.horizontal, 26).padding(.bottom, 18)
@@ -180,6 +180,7 @@ struct ControlPanel: View {
                 switch tab {
                 case .chapters: ChapterList(model: model)
                 case .search: SearchPanel(model: model)
+                case .listening: ListeningPanel(model: model, listening: model.listening)
                 case .appearance: AppearancePanel(model: model)
                 case .shortcuts: ShortcutPanel(model: model)
                 }
@@ -196,6 +197,66 @@ struct ControlPanel: View {
                         .font(.system(size: 11)).foregroundColor(ink)
                 }.buttonStyle(.plain)
             }.padding(.horizontal, 26).padding(.vertical, 17)
+        }
+    }
+}
+
+struct ListeningPanel: View {
+    @ObservedObject var model: ReaderModel
+    @ObservedObject var listening: ListeningController
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("把这一页，读给你听").font(.system(size: 15, weight: .medium)).foregroundColor(ink)
+                    HStack(spacing: 8) {
+                        if listening.state == .loading { ProgressView().controlSize(.small) }
+                        Text(listening.status).font(.system(size: 12)).foregroundColor(listening.state == .failed ? accent : muted)
+                    }
+                }
+                HStack(spacing: 10) {
+                    if listening.isActive {
+                        Button(listening.state == .paused ? "继续听" : "暂停") { listening.togglePause() }
+                            .buttonStyle(QuietButtonStyle(primary: true))
+                        Button("停止") { listening.stop() }.buttonStyle(QuietButtonStyle())
+                    } else {
+                        Button("从当前页开始") {
+                            model.flushPosition()
+                            listening.start(at: model.currentPosition)
+                        }.buttonStyle(QuietButtonStyle(primary: true)).disabled(model.book == nil)
+                        if listening.canResume {
+                            Button("继续上次听书") { listening.resumeBookmark() }.buttonStyle(QuietButtonStyle())
+                        }
+                    }
+                }
+                if listening.isActive, let chunk = listening.currentChunk {
+                    Text(chunk.text.trimmingCharacters(in: .whitespacesAndNewlines))
+                        .font(.system(size: 12)).foregroundColor(ink).lineSpacing(6).lineLimit(4)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(14)
+                        .background(canvas).clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("音色").font(.system(size: 11, weight: .medium)).foregroundColor(ink)
+                    Picker("音色", selection: $listening.voice) {
+                        ForEach(ListeningVoice.all) { voice in Text(voice.name).tag(voice.id) }
+                    }.labelsHidden().frame(maxWidth: .infinity).accessibilityLabel("听书音色")
+                    Text("切换音色后，从这段文字重新开始。")
+                        .font(.system(size: 10)).foregroundColor(muted)
+                }
+                VStack(spacing: 9) {
+                    HStack {
+                        Text("播放速度").font(.system(size: 11, weight: .medium)).foregroundColor(ink)
+                        Spacer()
+                        Text(String(format: "%.2g 倍", listening.speed)).font(.system(size: 11, design: .monospaced)).foregroundColor(muted)
+                    }
+                    Slider(value: $listening.speed, in: 0.75...2, step: 0.25)
+                        .tint(accent).controlSize(.small).accessibilityLabel("听书播放速度")
+                }
+                Toggle("跟随朗读翻页", isOn: $listening.followsText).font(.system(size: 12)).foregroundColor(ink)
+                Text("语音按段生成，自动接着往下读。生成时需要联网，待朗读文字会发送给微软；缓存的音频可重复播放，进度自动保存在本机。")
+                    .font(.system(size: 11)).foregroundColor(muted).lineSpacing(5)
+            }.padding(.horizontal, 28).padding(.top, 6).padding(.bottom, 24)
         }
     }
 }

@@ -3,12 +3,13 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 enum PanelTab: String, CaseIterable, Identifiable {
-    case chapters = "目录", search = "搜索", appearance = "外观", shortcuts = "快捷键"
+    case chapters = "目录", search = "搜索", listening = "听书", appearance = "外观", shortcuts = "快捷键"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .chapters: return "list.bullet"
         case .search: return "magnifyingglass"
+        case .listening: return "headphones"
         case .appearance: return "textformat.size"
         case .shortcuts: return "keyboard"
         }
@@ -51,6 +52,11 @@ struct ReaderPreferences: Codable, Equatable {
             margin == other.margin && foreground == other.foreground
     }
 
+    func hasSameLayout(as other: Self) -> Bool {
+        fontName == other.fontName && fontSize == other.fontSize &&
+            lineSpacing == other.lineSpacing && margin == other.margin
+    }
+
     static let themes: [(name: String, background: String, foreground: String)] = [
         ("素白", "FAFAF8", "343735"),
         ("雾灰", "F7F8FA", "383D44"),
@@ -81,10 +87,14 @@ struct JumpRequest {
 
 @MainActor
 final class ReaderModel: ObservableObject {
+    let listening = ListeningController()
     @Published var book: Book?
     @Published var bookID = UUID()
     @Published var panel: PanelTab? {
-        didSet { if panel != .shortcuts { recordingShortcut = nil; shortcutMessage = nil } }
+        didSet {
+            if panel != .shortcuts { recordingShortcut = nil; shortcutMessage = nil }
+            updatePanelWindow(wasOpen: oldValue != nil)
+        }
     }
     @Published var preferences: ReaderPreferences {
         didSet { savePreferences() }
@@ -114,6 +124,9 @@ final class ReaderModel: ObservableObject {
     private var saveTask: Task<Void, Never>?
     private var loadID = UUID()
     private var filePicker: NSOpenPanel?
+    private var pendingPosition: (book: UUID, position: Int, progress: Double)?
+    private var readingFrame: NSRect?
+    private var expandedPanelFrame: NSRect?
     weak var window: NSWindow?
     var cacheURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -130,6 +143,11 @@ final class ReaderModel: ObservableObject {
             saved.sanitize()
             preferences = saved
         } else { preferences = ReaderPreferences() }
+        listening.onPosition = { [weak self] position in
+            guard let self, let book = self.book else { return }
+            self.updatePosition(position, progress: Double(position) / Double(max(1, (book.text as NSString).length)))
+            self.jump = JumpRequest(range: NSRange(location: position, length: 0), highlight: false)
+        }
     }
 
     func restore() {
@@ -145,11 +163,9 @@ final class ReaderModel: ObservableObject {
             }.value
             guard loadID == token else { return }
             if let saved {
-                present(saved, persist: false)
                 let position = UserDefaults.standard.integer(forKey: "readingPosition")
-                currentPosition = max(0, min(position, (saved.text as NSString).length))
-                progress = min(1, max(0, UserDefaults.standard.double(forKey: "readingProgress")))
-                jump = JumpRequest(range: NSRange(location: currentPosition, length: 0), highlight: false)
+                let progress = UserDefaults.standard.double(forKey: "readingProgress")
+                present(saved, persist: false, startingAt: position, progress: progress)
             }
             isLoading = false
         }
@@ -174,6 +190,7 @@ final class ReaderModel: ObservableObject {
     }
 
     func load(_ url: URL) {
+        listening.stop()
         importTask?.cancel()
         let token = UUID()
         loadID = token
@@ -200,15 +217,17 @@ final class ReaderModel: ObservableObject {
         }
     }
 
-    func present(_ newBook: Book, persist: Bool = true) {
-        book = newBook
+    func present(_ newBook: Book, persist: Bool = true, startingAt position: Int = 0, progress savedProgress: Double = 0) {
+        listening.setBook(newBook)
+        pendingPosition = nil
         bookID = UUID()
         panel = nil
         query = ""
-        currentPosition = 0
-        progress = 0
+        currentPosition = max(0, min(position, (newBook.text as NSString).length))
+        progress = min(1, max(0, savedProgress))
         pageRequest = nil
-        jump = JumpRequest(range: NSRange(location: 0, length: 0), highlight: false)
+        jump = JumpRequest(range: NSRange(location: currentPosition, length: 0), highlight: false)
+        book = newBook
         window?.title = newBook.title + " — 留白"
         if persist {
             UserDefaults.standard.set(0, forKey: "readingPosition")
@@ -258,9 +277,11 @@ final class ReaderModel: ObservableObject {
     }
 
     func navigate(_ range: NSRange, highlight: Bool = false) {
+        listening.stop()
         guard let book else { return }
         let length = (book.text as NSString).length
         let safe = NSRange(location: min(max(0, range.location), length), length: min(range.length, length - min(max(0, range.location), length)))
+        stagePosition(safe.location, progress: length == 0 ? 0 : Double(safe.location) / Double(length))
         currentPosition = safe.location
         jump = JumpRequest(range: safe, highlight: highlight)
         panel = nil
@@ -273,10 +294,63 @@ final class ReaderModel: ObservableObject {
     }
 
     func updatePosition(_ position: Int, progress: Double) {
+        stagePosition(position, progress: progress)
+        flushPosition()
+    }
+
+    func stagePosition(_ position: Int, progress: Double) {
+        pendingPosition = (bookID, position, progress)
+    }
+
+    func flushPosition() {
+        guard let pendingPosition, pendingPosition.book == bookID else { return }
+        let position = pendingPosition.position
+        let progress = pendingPosition.progress
         currentPosition = position
         self.progress = progress
         UserDefaults.standard.set(position, forKey: "readingPosition")
         UserDefaults.standard.set(progress, forKey: "readingProgress")
+    }
+
+    func finishReading() {
+        listening.stop()
+        flushPosition()
+        panel = nil
+        window?.saveFrame(usingName: "LiubaiReaderWindow")
+    }
+
+    private func updatePanelWindow(wasOpen: Bool) {
+        guard let window else { return }
+        if window.styleMask.contains(.fullScreen) {
+            if panel == nil && wasOpen {
+                window.minSize = ReaderWindow.minimumReadingSize
+                readingFrame = nil
+                expandedPanelFrame = nil
+            }
+            return
+        }
+        if panel != nil && !wasOpen {
+            let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? window.frame
+            let expanded = PanelWindowGeometry.expandedFrame(from: window.frame, within: visible)
+            if expanded != window.frame {
+                readingFrame = window.frame
+                expandedPanelFrame = expanded
+                window.setFrame(expanded, display: true)
+            }
+            window.minSize = NSSize(width: min(560, visible.width), height: min(580, visible.height))
+        } else if panel == nil && wasOpen {
+            window.minSize = ReaderWindow.minimumReadingSize
+            if var original = readingFrame, let expandedPanelFrame {
+                original.origin.x += window.frame.minX - expandedPanelFrame.minX
+                original.origin.y += window.frame.maxY - expandedPanelFrame.maxY
+                let visible = window.screen?.visibleFrame ?? original
+                original.origin.x = min(max(original.minX, visible.minX), max(visible.minX, visible.maxX - original.width))
+                original.origin.y = min(max(original.minY, visible.minY), max(visible.minY, visible.maxY - original.height))
+                window.setFrame(original, display: true)
+            }
+            readingFrame = nil
+            expandedPanelFrame = nil
+        }
     }
 
     private func savePreferences() {

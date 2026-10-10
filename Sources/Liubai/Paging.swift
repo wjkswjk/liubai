@@ -52,7 +52,7 @@ struct PagingKey: Codable, Equatable {
     var isReserved: Bool {
         if [36, 48, 53, 76].contains(keyCode) { return true }
         let flags = NSEvent.ModifierFlags(rawValue: modifiers)
-        if flags == .command && [0, 3, 4, 6, 7, 8, 9, 12, 13, 17, 24, 27, 31, 43, 46].contains(keyCode) { return true }
+        if flags == .command && [0, 3, 4, 6, 7, 8, 9, 12, 13, 17, 24, 27, 31, 37, 43, 46].contains(keyCode) { return true }
         if flags == [.command, .shift] && [6, 24, 43, 44].contains(keyCode) { return true }
         if flags == [.command, .control] && keyCode == 3 { return true }
         if flags == [.command, .option] && [4, 123, 124].contains(keyCode) { return true }
@@ -100,6 +100,30 @@ enum PagingGeometry {
 struct ReadingLine {
     let rect: NSRect
     let characters: NSRange
+}
+
+struct PagingScrollGesture {
+    private var accumulated: CGFloat = 0
+    private var didTurn = false
+
+    mutating func direction(delta: CGFloat, phase: NSEvent.Phase, momentum: NSEvent.Phase,
+                            precise: Bool) -> PageDirection? {
+        guard momentum.isEmpty else { return nil }
+        if phase.contains(.began) { accumulated = 0; didTurn = false }
+        if phase.contains(.ended) || phase.contains(.cancelled) {
+            accumulated = 0
+            didTurn = false
+            return nil
+        }
+        guard abs(delta) > 0, !didTurn else { return nil }
+        accumulated += delta
+        let threshold: CGFloat = precise ? 8 : 0.01
+        guard abs(accumulated) >= threshold else { return nil }
+        let result: PageDirection = accumulated < 0 ? .next : .previous
+        accumulated = 0
+        didTurn = !phase.isEmpty
+        return result
+    }
 }
 
 enum ReadingPageGeometry {

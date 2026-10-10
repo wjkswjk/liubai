@@ -282,10 +282,10 @@ final class BookTests: XCTestCase {
         XCTAssertEqual(ReadingPageGeometry.previousOrigin(lines, origin: 0, height: 280), 0)
     }
 
-    private func readerFixture() -> (ReaderView.Coordinator, ReadingScrollView, ReadingTextView) {
+    private func readerFixture(bookText: String? = nil) -> (ReaderView.Coordinator, ReadingScrollView, ReadingTextView) {
         let model = ReaderModel()
         model.preferences = ReaderPreferences()
-        model.book = Book(title: "缩放回归", text: (0..<100).map { "第\($0)行：窗口变窄时，所有文字都应重新换行并完整显示。😀" }.joined(separator: "\n"))
+        model.book = Book(title: "缩放回归", text: bookText ?? (0..<100).map { "第\($0)行：窗口变窄时，所有文字都应重新换行并完整显示。😀" }.joined(separator: "\n"))
         let scroll = ReadingScrollView(frame: NSRect(x: 0, y: 0, width: 900, height: 740))
         scroll.hasVerticalScroller = false
         scroll.hasHorizontalScroller = false
@@ -394,6 +394,135 @@ final class BookTests: XCTestCase {
         XCTAssertTrue(coordinator.lines.last!.rect.maxY <= scroll.contentSize.height - ReadingPageGeometry.bottom + 0.5)
     }
 
+    func testPageCacheIsBoundedAndInvalidatesOnResize() {
+        let (coordinator, scroll, text) = readerFixture()
+        defer { coordinator.removeObserver() }
+        let first = text.string
+        coordinator.turnPage(.next)
+        coordinator.turnPage(.previous)
+        XCTAssertEqual(text.string, first)
+        XCTAssertTrue(coordinator.cacheHits > 0)
+        scroll.setFrameSize(NSSize(width: 240, height: 160))
+        coordinator.resize(scroll.contentSize)
+        XCTAssertEqual(coordinator.cachedPageCount, 1)
+        for _ in 0..<25 { coordinator.turnPage(.next) }
+        XCTAssertEqual(coordinator.cachedPageCount, 16)
+        coordinator.model.preferences.fontSize = 30
+        coordinator.update()
+        XCTAssertEqual(coordinator.cachedPageCount, 1)
+        XCTAssertTrue(coordinator.lines.last!.rect.maxY <= scroll.contentSize.height - ReadingPageGeometry.bottom + 0.5)
+    }
+
+    func testChangingColorPreservesPagesHistoryAndCachedTextColor() {
+        let (coordinator, _, text) = readerFixture()
+        defer { coordinator.removeObserver() }
+        let first = text.string
+        coordinator.turnPage(.next)
+        let position = coordinator.anchor
+        let boundary = coordinator.nextPosition
+        let cached = coordinator.cachedPageCount
+        coordinator.model.preferences.foreground = "CC4433"
+        coordinator.update()
+        XCTAssertEqual(coordinator.anchor, position)
+        XCTAssertEqual(coordinator.nextPosition, boundary)
+        XCTAssertEqual(coordinator.cachedPageCount, cached)
+        XCTAssertEqual(coordinator.pageHistory, [0])
+        coordinator.turnPage(.previous)
+        XCTAssertEqual(text.string, first)
+        let color = text.textStorage!.attribute(.foregroundColor, at: 0, effectiveRange: nil) as! NSColor
+        XCTAssertEqual(color.hex, "CC4433")
+    }
+
+    func testImmediateQuitFlushesLatestPagePosition() {
+        let (coordinator, _, _) = readerFixture()
+        defer { coordinator.removeObserver() }
+        coordinator.turnPage(.next)
+        coordinator.model.finishReading()
+        XCTAssertEqual(coordinator.model.currentPosition, coordinator.anchor)
+        XCTAssertEqual(UserDefaults.standard.integer(forKey: "readingPosition"), coordinator.anchor)
+        let position = coordinator.model.currentPosition
+        coordinator.model.bookID = UUID()
+        coordinator.model.flushPosition()
+        XCTAssertEqual(coordinator.model.currentPosition, position)
+    }
+
+    func testRestoredBookStartsAtSavedPageBeforeRendering() {
+        let (coordinator, _, text) = readerFixture()
+        defer { coordinator.removeObserver() }
+        coordinator.turnPage(.next)
+        let position = coordinator.anchor
+        let expected = text.string
+        let book = coordinator.model.book!
+        coordinator.model.present(book, persist: false, startingAt: position, progress: 0.3)
+        XCTAssertEqual(coordinator.model.jump!.range.location, position)
+        coordinator.update()
+        XCTAssertEqual(coordinator.anchor, position)
+        XCTAssertEqual(text.string, expected)
+    }
+
+    func testSavedPositionSurvivesInitialZeroSizeViewport() {
+        let (coordinator, scroll, text) = readerFixture()
+        defer { coordinator.removeObserver() }
+        let position = (coordinator.source.string as NSString).range(of: "第70行").location
+        scroll.setFrameSize(.zero)
+        coordinator.model.present(coordinator.model.book!, persist: false, startingAt: position)
+        coordinator.update()
+        XCTAssertEqual(coordinator.anchor, position)
+        scroll.setFrameSize(NSSize(width: 520, height: 500))
+        coordinator.resize(scroll.contentSize)
+        XCTAssertEqual(coordinator.anchor, position)
+        XCTAssertTrue(text.string.hasPrefix("第70行"))
+    }
+
+    func testPanelExpandsWithinScreenAndLeavesLargeWindowUnchanged() {
+        let visible = NSRect(x: 200, y: 100, width: 1440, height: 900)
+        let tiny = NSRect(x: 1500, y: 120, width: 240, height: 160)
+        let expanded = PanelWindowGeometry.expandedFrame(from: tiny, within: visible)
+        XCTAssertEqual(expanded.size, NSSize(width: 560, height: 580))
+        XCTAssertTrue(visible.contains(expanded))
+        let large = NSRect(x: 300, y: 200, width: 900, height: 740)
+        XCTAssertEqual(PanelWindowGeometry.expandedFrame(from: large, within: visible), large)
+    }
+
+    func testTrackpadTurnsOncePerGestureAndIgnoresMomentum() {
+        var gesture = PagingScrollGesture()
+        XCTAssertEqual(gesture.direction(delta: -1, phase: .began, momentum: [], precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: -3, phase: .changed, momentum: [], precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: -5, phase: .changed, momentum: [], precise: true), .next)
+        XCTAssertEqual(gesture.direction(delta: -30, phase: .changed, momentum: [], precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: -30, phase: [], momentum: .began, precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: 0, phase: .ended, momentum: [], precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: 12, phase: .began, momentum: [], precise: true), .previous)
+        XCTAssertEqual(gesture.direction(delta: 0, phase: .cancelled, momentum: [], precise: true), nil)
+        XCTAssertEqual(gesture.direction(delta: -1, phase: [], momentum: [], precise: false), .next)
+        XCTAssertEqual(gesture.direction(delta: -1, phase: [], momentum: [], precise: false), .next)
+    }
+
+    func testSpaceAndShiftSpaceTurnPages() {
+        let text = ReadingTextView()
+        var directions: [PageDirection] = []
+        text.turnPage = { directions.append($0) }
+        for flags: NSEvent.ModifierFlags in [[], .shift] {
+            let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                windowNumber: 0, context: nil, characters: " ", charactersIgnoringModifiers: " ",
+                isARepeat: false, keyCode: 49)!
+            text.keyDown(with: event)
+        }
+        XCTAssertEqual(directions, [.next, .previous])
+    }
+
+    func benchmarkReading() {
+        let large = String(repeating: "山里的早晨安静而清凉，文字应当随窗口自动换行，翻页立即切换。\n", count: 50_000)
+        let start = Date.timeIntervalSinceReferenceDate
+        let (coordinator, _, _) = readerFixture(bookText: large)
+        defer { coordinator.removeObserver() }
+        let opened = Date.timeIntervalSinceReferenceDate
+        for _ in 0..<100 { coordinator.turnPage(.next); coordinator.turnPage(.previous) }
+        let ended = Date.timeIntervalSinceReferenceDate
+        print(String(format: "基准：%.2f MB，首次准备 %.1f ms，往返翻页平均 %.2f ms/页",
+            Double(large.utf8.count) / 1_000_000, (opened - start) * 1000, (ended - opened) * 1000 / 200))
+    }
+
     func testWiderResizeBandAndAllCorners() {
         let size = NSSize(width: 900, height: 740)
         XCTAssertEqual(ResizeEdges.hitTest(NSPoint(x: 9, y: 350), size: size), .left)
@@ -411,8 +540,9 @@ final class BookTests: XCTestCase {
 @main
 @MainActor
 enum TestRunner {
-    static func main() throws {
+    static func main() async throws {
         let tests = BookTests()
+        if CommandLine.arguments.contains("--benchmark") { tests.benchmarkReading(); return }
         tests.testChineseChaptersAndUTF16Offsets()
         tests.testCommonHeadingFormats()
         tests.testProseIsNotMistakenForChapters()
@@ -444,7 +574,23 @@ enum TestRunner {
         tests.testNativePagesPreserveWholeBookAndUnicodeBoundaries()
         tests.testSearchHighlightUsesGlobalPositionAfterPaging()
         tests.testLargestFontStillFitsSmallestWindow()
-        print("31 项测试通过：透明空白响应、反复缩放、完整行分页、Unicode 不漏字、即时翻页与搜索跳转。")
+        tests.testPageCacheIsBoundedAndInvalidatesOnResize()
+        tests.testChangingColorPreservesPagesHistoryAndCachedTextColor()
+        tests.testImmediateQuitFlushesLatestPagePosition()
+        tests.testRestoredBookStartsAtSavedPageBeforeRendering()
+        tests.testSavedPositionSurvivesInitialZeroSizeViewport()
+        tests.testPanelExpandsWithinScreenAndLeavesLargeWindowUnchanged()
+        tests.testTrackpadTurnsOncePerGestureAndIgnoresMomentum()
+        tests.testSpaceAndShiftSpaceTurnPages()
+        let listening = ListeningTests()
+        listening.testLongBookChunksCoverUnicodeAndCrossChapters()
+        listening.testEscapingAndByteLimitForXMLHeavyText()
+        try listening.testAudioFramesRejectTruncationAndAcceptEndMarker()
+        listening.testTokenAndSSMLMatchServiceContract()
+        try await listening.testAudioCacheReusesTextAndSeparatesVoices()
+        try await listening.testPauseWhileLoadingPreservesResumeTimeAndBookmark()
+        try await listening.testStopAndBookChangeCancelLoadingWithoutStaleCallbacks()
+        print("46 项测试通过：阅读与分页、Edge 语音协议、长文本切分、音频缓存、听书进度与取消。")
     }
 }
 #endif

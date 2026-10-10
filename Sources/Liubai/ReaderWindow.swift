@@ -131,6 +131,16 @@ struct ResizeEdges: OptionSet {
     }
 }
 
+enum PanelWindowGeometry {
+    static func expandedFrame(from frame: NSRect, within visible: NSRect) -> NSRect {
+        let size = NSSize(width: min(visible.width, max(frame.width, 560)),
+                          height: min(visible.height, max(frame.height, 580)))
+        let x = min(max(visible.minX, frame.midX - size.width / 2), max(visible.minX, visible.maxX - size.width))
+        let y = min(max(visible.minY, frame.midY - size.height / 2), max(visible.minY, visible.maxY - size.height))
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+}
+
 // Borderless windows need explicit key/main eligibility and edge resizing.
 final class ReaderWindow: NSWindow {
     static let minimumReadingSize = NSSize(width: 240, height: 160)
@@ -169,6 +179,10 @@ final class ReaderWindow: NSWindow {
     }
     override func sendEvent(_ event: NSEvent) {
         if event.type == .leftMouseDown, !styleMask.contains(.fullScreen), attachedSheet == nil {
+            if event.modifierFlags.contains(.option) {
+                trackMove(from: event)
+                return
+            }
             let edges = ResizeEdges.hitTest(event.locationInWindow, size: frame.size)
             if !edges.isEmpty {
                 trackResize(from: event, edges: edges)
